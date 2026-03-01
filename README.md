@@ -38,7 +38,7 @@ Required:
 Common optional settings:
 
 - `WHISPER_MODEL` (default `whisper-1`)
-- `NOTES_MODEL` (default `gpt-4o-mini`)
+- `NOTES_MODEL` (default `gpt-5.2`)
 - `MAX_UPLOAD_MB` (app upload limit; default `250`)
 - `JOB_WORKERS` (parallel background jobs; default `2`)
 - `OPENAI_MAX_BYTES` (OpenAI request cap; default `26214400`)

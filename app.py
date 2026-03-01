@@ -45,7 +45,7 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", token_hex(32))
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL_NAME = os.getenv("WHISPER_MODEL", "whisper-1")
-NOTES_MODEL = os.getenv("NOTES_MODEL", "gpt-4o-mini")
+NOTES_MODEL = os.getenv("NOTES_MODEL", "gpt-5.2")
 
 JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))
 OPENAI_MAX_BYTES = int(os.getenv("OPENAI_MAX_BYTES", str(25 * 1024 * 1024)))
