@@ -445,67 +445,55 @@ def _preprocess_audio(
         return audio_path, f"Audio preprocessing failed, using original upload. ({exc})"
 
 
-def _build_chunk_plan(duration_seconds: float | None, file_size: int) -> list[tuple[int, float, float]]:
-    chunk_seconds = max(CHUNK_MINUTES, 1) * 60
-    if duration_seconds and duration_seconds > 0:
-        chunks: list[tuple[int, float, float]] = []
-        start = 0.0
-        index = 0
-        while start < duration_seconds:
-            length = min(chunk_seconds, duration_seconds - start)
-            chunks.append((index, start, max(1.0, length)))
-            start += chunk_seconds
-            index += 1
-        return chunks
-
-    # Fallback if duration is unknown.
-    if file_size <= OPENAI_MAX_BYTES:
-        return [(0, 0.0, float(chunk_seconds))]
-    estimated_chunks = max(2, int((file_size / OPENAI_MAX_BYTES) + 0.999))
-    return [
-        (idx, float(idx * chunk_seconds), float(chunk_seconds))
-        for idx in range(estimated_chunks)
-    ]
-
-
-def _create_chunk_file(
+def _segment_audio_chunks(
     source_audio: str,
-    start_seconds: float,
-    length_seconds: float,
+    output_dir: str,
+    *,
     needs_conversion: bool,
-) -> str:
-    suffix = ".wav" if needs_conversion else Path(source_audio).suffix.lower() or ".m4a"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        out_path = tmp.name
+) -> list[tuple[int, str, float]]:
+    if not FFMPEG_EXE:
+        raise RuntimeError("FFmpeg is not available for chunking.")
+
+    chunk_seconds = max(CHUNK_MINUTES, 1) * 60
+    ext = ".wav" if needs_conversion else (Path(source_audio).suffix.lower() or ".m4a")
+    out_pattern = str(Path(output_dir) / f"chunk_%05d{ext}")
 
     command = [
-        FFMPEG_EXE or "ffmpeg",
+        FFMPEG_EXE,
         "-hide_banner",
         "-y",
-        "-ss",
-        f"{start_seconds:.3f}",
-        "-t",
-        f"{length_seconds:.3f}",
         "-i",
         source_audio,
         "-vn",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-reset_timestamps",
+        "1",
     ]
     if needs_conversion:
         command.extend(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
     else:
         command.extend(["-c:a", "copy"])
-    command.append(out_path)
+    command.append(out_pattern)
 
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
-        return out_path
     except Exception:
-        if os.path.exists(out_path):
-            os.remove(out_path)
         if not needs_conversion:
-            # Container-copy may fail; fallback to fast pcm conversion for this chunk.
-            return _create_chunk_file(source_audio, start_seconds, length_seconds, needs_conversion=True)
+            # Copy segmentation can fail on some containers; retry with PCM conversion.
+            return _segment_audio_chunks(source_audio, output_dir, needs_conversion=True)
         raise
+
+    chunk_files = sorted(Path(output_dir).glob("chunk_*"))
+    if not chunk_files:
+        raise RuntimeError("No chunks were generated from audio.")
+
+    chunk_list: list[tuple[int, str, float]] = []
+    for index, chunk_file in enumerate(chunk_files):
+        chunk_list.append((index, str(chunk_file), float(index * chunk_seconds)))
+    return chunk_list
 
 
 def _transcribe_with_chunking(
@@ -533,42 +521,44 @@ def _transcribe_with_chunking(
             progress_callback("Transcribing single chunk", 100)
         return text, segments
 
-    chunk_plan = _build_chunk_plan(duration_seconds, original_size)
-    total_chunks = max(1, len(chunk_plan))
-    logger.info(
-        "chunk_pipeline total_chunks=%s workers=%s force_conversion=%s",
-        total_chunks,
-        CHUNK_TRANSCRIBE_WORKERS,
-        force_conversion_chunks,
-    )
+    with tempfile.TemporaryDirectory() as chunk_dir:
+        segment_started = time.perf_counter()
+        chunk_list = _segment_audio_chunks(
+            audio_path,
+            chunk_dir,
+            needs_conversion=force_conversion_chunks,
+        )
+        logger.info(
+            "chunk_segmentation total_chunks=%s elapsed=%.2fs",
+            len(chunk_list),
+            time.perf_counter() - segment_started,
+        )
 
-    results: dict[int, tuple[float, str, list[dict[str, object]]]] = {}
-    errors: list[str] = []
-    produced = 0
-    completed = 0
+        total_chunks = max(1, len(chunk_list))
+        logger.info(
+            "chunk_pipeline total_chunks=%s workers=%s force_conversion=%s",
+            total_chunks,
+            CHUNK_TRANSCRIBE_WORKERS,
+            force_conversion_chunks,
+        )
 
-    def submit_chunk(
-        executor: ThreadPoolExecutor,
-        idx: int,
-        start_seconds: float,
-        length_seconds: float,
-    ):
-        def worker() -> tuple[int, float, str, list[dict[str, object]]]:
-            prep_start = time.perf_counter()
-            chunk_path = _create_chunk_file(
-                audio_path,
-                start_seconds=start_seconds,
-                length_seconds=length_seconds,
-                needs_conversion=force_conversion_chunks,
-            )
-            prep_elapsed = time.perf_counter() - prep_start
-            transcribe_start = time.perf_counter()
-            try:
+        results: dict[int, tuple[float, str, list[dict[str, object]]]] = {}
+        errors: list[str] = []
+        completed = 0
+
+        def submit_chunk(
+            executor: ThreadPoolExecutor,
+            idx: int,
+            chunk_path: str,
+            offset_seconds: float,
+        ):
+            def worker() -> tuple[int, float, str, list[dict[str, object]]]:
+                transcribe_start = time.perf_counter()
                 chunk_size = os.path.getsize(chunk_path)
                 if chunk_size > OPENAI_MAX_BYTES:
                     raise ValueError(
-                        "Chunk is still too large for OpenAI API limit. "
-                        "Reduce CHUNK_MINUTES/CHUNK_BITRATE."
+                        f"Chunk {idx + 1} exceeds OpenAI API limit ({chunk_size} bytes). "
+                        "Reduce CHUNK_MINUTES."
                     )
                 text_part, segment_part = _run_whisper_request(
                     audio_path=chunk_path,
@@ -576,49 +566,47 @@ def _transcribe_with_chunking(
                     language=language,
                     include_segments=include_segments,
                 )
-            finally:
-                if os.path.exists(chunk_path):
-                    os.remove(chunk_path)
-            transcribe_elapsed = time.perf_counter() - transcribe_start
-            logger.info(
-                "chunk index=%s prep=%.2fs transcribe=%.2fs",
-                idx,
-                prep_elapsed,
-                transcribe_elapsed,
-            )
-            return idx, start_seconds, text_part, segment_part
-
-        return executor.submit(worker)
-
-    with ThreadPoolExecutor(max_workers=max(1, CHUNK_TRANSCRIBE_WORKERS)) as pool:
-        futures: dict[object, tuple[int, float, float]] = {}
-
-        for idx, start_seconds, length_seconds in chunk_plan:
-            fut = submit_chunk(pool, idx, start_seconds, length_seconds)
-            futures[fut] = (idx, start_seconds, length_seconds)
-            produced += 1
-            if progress_callback:
-                prep_pct = int((produced / total_chunks) * 35)
-                progress_callback(
-                    f"Preparing/transcribing chunks ({produced}/{total_chunks} queued)",
-                    prep_pct,
+                transcribe_elapsed = time.perf_counter() - transcribe_start
+                logger.info(
+                    "chunk index=%s transcribe=%.2fs size=%s",
+                    idx,
+                    transcribe_elapsed,
+                    chunk_size,
                 )
+                return idx, offset_seconds, text_part, segment_part
 
-        for fut in as_completed(futures):
-            try:
-                idx, offset_seconds, text_part, segment_part = fut.result()
-                results[idx] = (offset_seconds, text_part, segment_part)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(str(exc))
-            finally:
-                completed += 1
+            return executor.submit(worker)
+
+        with ThreadPoolExecutor(max_workers=max(1, CHUNK_TRANSCRIBE_WORKERS)) as pool:
+            futures: dict[object, tuple[int, str, float]] = {}
+            for idx, chunk_path, offset_seconds in chunk_list:
+                fut = submit_chunk(pool, idx, chunk_path, offset_seconds)
+                futures[fut] = (idx, chunk_path, offset_seconds)
                 if progress_callback:
-                    # Reserve first 35% for chunk production and the remainder for completion.
-                    pct = 35 + int((completed / total_chunks) * 65)
+                    queued = len(futures)
+                    prep_pct = int((queued / total_chunks) * 35)
                     progress_callback(
-                        f"Transcribing chunks ({completed}/{total_chunks} completed)",
-                        min(100, pct),
+                        f"Preparing/transcribing chunks ({queued}/{total_chunks} queued)",
+                        prep_pct,
                     )
+
+            for fut in as_completed(futures):
+                idx, chunk_path, _offset = futures[fut]
+                try:
+                    r_idx, offset_seconds, text_part, segment_part = fut.result()
+                    results[r_idx] = (offset_seconds, text_part, segment_part)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc))
+                finally:
+                    completed += 1
+                    if os.path.exists(chunk_path):
+                        os.remove(chunk_path)
+                    if progress_callback:
+                        pct = 35 + int((completed / total_chunks) * 65)
+                        progress_callback(
+                            f"Transcribing chunks ({completed}/{total_chunks} completed)",
+                            min(100, pct),
+                        )
 
     if errors:
         raise RuntimeError(errors[0])
