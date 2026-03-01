@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meeting Transcriber</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>Meeting Transcriber</h1>
+      <p class="subtitle">Upload a meeting recording and use Whisper to transcribe or translate it.</p>
+
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <ul class="alerts">
+            {% for message in messages %}
+              <li>{{ message }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      {% endwith %}
+
+      <form method="post" action="{{ url_for('transcribe') }}" enctype="multipart/form-data" class="panel">
+        <label for="audio_file">Audio file</label>
+        <input id="audio_file" type="file" name="audio_file" accept="audio/*,video/*" required />
+
+        <label for="language">Language code (optional, e.g. <code>en</code>)</label>
+        <input id="language" type="text" name="language" maxlength="8" placeholder="auto-detect if empty" />
+
+        <label for="task_mode">Mode</label>
+        <select id="task_mode" name="task_mode">
+          <option value="transcribe" selected>Transcribe (keep original language)</option>
+          <option value="translate">Translate to English</option>
+        </select>
+        <p class="help-text">
+          Language hint is used for transcribe mode; translate mode outputs English.
+        </p>
+
+        <label class="checkbox">
+          <input type="checkbox" name="timestamps" checked />
+          Include segment timestamps
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="speaker_attribution" />
+          Enable speaker attribution (beta)
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="generate_notes" />
+          Generate meeting notes
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="notes_in_english" />
+          Notes in English
+        </label>
+
+        <button type="submit">Transcribe</button>
+      </form>
+
+      {% if jobs %}
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Recent Jobs</h2>
+          </div>
+          <ul class="job-list">
+            {% for job in jobs %}
+              <li>
+                <a href="{{ url_for('index', job_id=job.id) }}">
+                  {{ job.original_filename }}
+                </a>
+                <span class="job-mode">{{ job.task_mode }}</span>
+                <span class="job-status status-{{ job.status }}">{{ job.status }}</span>
+              </li>
+            {% endfor %}
+          </ul>
+        </section>
+      {% endif %}
+
+      {% if selected_job %}
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Job {{ selected_job.id[:8] }}</h2>
+            <div class="download-links">
+              {% if selected_job.status == "completed" and selected_job.transcript_txt %}
+                <a href="{{ url_for('download_artifact', job_id=selected_job.id, artifact='transcript_txt') }}">Download txt</a>
+              {% endif %}
+              {% if selected_job.status == "completed" and selected_job.transcript_json %}
+                <a href="{{ url_for('download_artifact', job_id=selected_job.id, artifact='transcript_json') }}">Download JSON</a>
+              {% endif %}
+              {% if selected_job.status == "completed" and selected_job.notes_txt %}
+                <a href="{{ url_for('download_artifact', job_id=selected_job.id, artifact='notes_txt') }}">Download notes.txt</a>
+              {% endif %}
+              {% if selected_job.status == "completed" and selected_job.notes_json %}
+                <a href="{{ url_for('download_artifact', job_id=selected_job.id, artifact='notes_json') }}">Download notes.json</a>
+              {% endif %}
+            </div>
+          </div>
+          <p class="job-meta">
+            <strong>File:</strong> {{ selected_job.original_filename }} |
+            <strong>Mode:</strong> {{ selected_job.task_mode }} |
+            <strong>Status:</strong>
+            <span id="job-status" class="job-status status-{{ selected_job.status }}">{{ selected_job.status }}</span>
+          </p>
+          <div class="progress-wrap">
+            <div class="progress-title">
+              <strong>Overall progress</strong>
+              <span id="overall-progress-label">{{ selected_job.overall_progress or 0 }}%</span>
+            </div>
+            <div class="progress-track">
+              <div
+                id="overall-progress-bar"
+                class="progress-bar"
+                style="width: {{ selected_job.overall_progress or 0 }}%;"
+              ></div>
+            </div>
+          </div>
+
+          <div class="stage-progress-list">
+            {% for stage in selected_job.stage_order or ["preprocess", "transcribe", "diarize", "notes", "finalize"] %}
+              {% if selected_job.stage_enabled and selected_job.stage_enabled.get(stage) %}
+                <div class="stage-progress-row">
+                  <div class="stage-progress-header">
+                    <span>{{ (selected_job.stage_labels or {}).get(stage, stage) }}</span>
+                    <span
+                      class="stage-state stage-{{ (selected_job.stage_status or {}).get(stage, 'pending') }}"
+                      data-stage-status="{{ stage }}"
+                    >
+                      {{ (selected_job.stage_status or {}).get(stage, "pending") }}
+                    </span>
+                  </div>
+                  <div class="progress-track stage-track">
+                    <div
+                      class="progress-bar stage-bar"
+                      data-stage-bar="{{ stage }}"
+                      style="width: {{ (selected_job.stage_progress or {}).get(stage, 0) }}%;"
+                    ></div>
+                  </div>
+                </div>
+              {% endif %}
+            {% endfor %}
+          </div>
+          <p id="job-detail" class="info">{{ selected_job.status_detail or "" }}</p>
+
+          {% if selected_job.warnings %}
+            <ul class="alerts warning-list">
+              {% for warning in selected_job.warnings %}
+                <li>{{ warning }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+
+          {% if selected_job.status in ["queued", "running"] %}
+            <p id="job-message" class="info">
+              Transcription is in progress. This page will auto-refresh when done.
+            </p>
+          {% elif selected_job.status == "failed" %}
+            <p class="error">
+              {{ selected_job.error or "The job failed without an error message." }}
+            </p>
+          {% elif selected_job.transcript_txt %}
+            <textarea readonly>{{ selected_job.transcript_txt }}</textarea>
+          {% endif %}
+        </section>
+      {% endif %}
+    </main>
+
+    {% if selected_job and selected_job.status in ["queued", "running"] %}
+      <script>
+        const jobId = "{{ selected_job.id }}";
+        const statusEl = document.getElementById("job-status");
+        const detailEl = document.getElementById("job-detail");
+        const overallLabelEl = document.getElementById("overall-progress-label");
+        const overallBarEl = document.getElementById("overall-progress-bar");
+        const msgEl = document.getElementById("job-message");
+
+        async function pollJob() {
+          try {
+            const res = await fetch(`/jobs/${jobId}/status`, { cache: "no-store" });
+            if (!res.ok) {
+              if (msgEl) msgEl.textContent = "Could not read job status.";
+              return;
+            }
+            const data = await res.json();
+            if (statusEl) {
+              statusEl.textContent = data.status;
+              statusEl.className = `job-status status-${data.status}`;
+            }
+            if (overallLabelEl) {
+              const overallRaw = Number.parseFloat(data.overall_progress);
+              const overall = Number.isFinite(overallRaw) ? overallRaw : 0;
+              overallLabelEl.textContent = `${overall}%`;
+            }
+            if (overallBarEl) {
+              const overallRaw = Number.parseFloat(data.overall_progress);
+              const overall = Number.isFinite(overallRaw) ? overallRaw : 0;
+              overallBarEl.style.width = `${overall}%`;
+            }
+            if (data.stage_progress && typeof data.stage_progress === "object") {
+              Object.entries(data.stage_progress).forEach(([stage, progress]) => {
+                const bar = document.querySelector(`[data-stage-bar="${stage}"]`);
+                const pct = Number.parseFloat(progress);
+                if (bar && Number.isFinite(pct)) {
+                  bar.style.width = `${pct}%`;
+                }
+              });
+            }
+            if (data.stage_status && typeof data.stage_status === "object") {
+              Object.entries(data.stage_status).forEach(([stage, stageStatus]) => {
+                const statusBadge = document.querySelector(`[data-stage-status="${stage}"]`);
+                if (statusBadge) {
+                  statusBadge.textContent = stageStatus;
+                  statusBadge.className = `stage-state stage-${stageStatus}`;
+                }
+              });
+            }
+            if (detailEl && data.status_detail) {
+              detailEl.textContent = data.status_detail;
+            }
+
+            if (data.status === "completed" || data.status === "failed") {
+              window.location.reload();
+              return;
+            }
+          } catch (err) {
+            if (msgEl) msgEl.textContent = "Status check failed. Retrying...";
+          }
+          setTimeout(pollJob, 3000);
+        }
+
+        setTimeout(pollJob, 1200);
+      </script>
+    {% endif %}
+  </body>
+</html>
